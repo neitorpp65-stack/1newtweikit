@@ -967,7 +967,10 @@ class Bot:
         except Exception:
             current_url = ""
 
-        if "intent/tweet" in current_url:
+        in_intent = "intent/tweet" in current_url
+        in_compose = "compose/post" in current_url or "compose/tweet" in current_url
+
+        if in_intent or in_compose:
             return True
 
         composer_selectors = [
@@ -988,7 +991,13 @@ class Bot:
             except Exception:
                 continue
 
-        return smart_utils.is_composer_active(self.driver)
+        fallback_active = smart_utils.is_composer_active(self.driver)
+
+        # Si ya salimos de intent/compose y no hay textbox visible,
+        # priorizamos el estado de URL para evitar falsos positivos.
+        if not in_intent and not in_compose:
+            return False
+        return fallback_active
 
     def _has_send_success_toast(self):
         """Detecta toast de éxito al enviar en ES/EN y variantes."""
@@ -1034,10 +1043,13 @@ class Bot:
         """Confirma envío en intent/reply esperando toast + cierre real del composer."""
         end_t = time.time() + timeout
         toast_seen = False
+        last_state_print = 0.0
 
         while time.time() < end_t:
             if self._driver_closed():
                 return False
+
+            now = time.time()
 
             if self._has_send_success_toast():
                 toast_seen = True
@@ -1046,6 +1058,17 @@ class Bot:
             if toast_seen and not composer_open:
                 self._log(user, "Toast de envío detectado y composer cerrado en tab intent/reply.")
                 return True
+
+            if now - last_state_print >= 1.0:
+                try:
+                    curr_url = self.driver.current_url
+                except Exception:
+                    curr_url = "(sin URL)"
+                self._log(
+                    user,
+                    f"Confirmando envío reply... toast={toast_seen} composer_activo={composer_open} url={curr_url}",
+                )
+                last_state_print = now
 
             await asyncio.sleep(0.25)
 
@@ -1331,6 +1354,7 @@ class Bot:
                     temp_handle = self.driver.current_window_handle
                     try:
                         intent_reply_url = f"https://x.com/intent/tweet?in_reply_to={status_id}&text={quote(content)}"
+                        self._log(user, f"Reply intent URL: {intent_reply_url}")
                         self.driver.get(intent_reply_url)
                         await asyncio.sleep(SLEEP_CARGA)
 
@@ -1358,12 +1382,25 @@ class Bot:
                                     self.driver.switch_to.window(base_handle)
                                 elif handles_after:
                                     self.driver.switch_to.window(handles_after[0])
+
+                                current_after = (self.driver.current_url or "") if self.driver else ""
+                                self._log(user, f"Tab temporal cerrada. URL activa actual: {current_after}")
                         except Exception as close_err:
                             self._log(user, f"No se pudo cerrar/salir de tab temporal de reply: {close_err}")
 
+                    try:
+                        active_url = (self.driver.current_url or "").lower()
+                    except Exception:
+                        active_url = ""
+                    if "intent/tweet" in active_url:
+                        self._log(user, "URL final aún contiene intent/tweet. Marcando como fallo para reintento.")
+                        reply_sent = False
+
                     if reply_sent:
                         dur = time.time() - start_t
+                        self._log(user, f"Reply finalizado correctamente en {dur:.1f}s.")
                         return True, dur
+                    self._log(user, "Reply no confirmado. Se devolverá a cola para reintento.")
                     return False, 0
                 else:
                     self._log(user, f"Modo '{TIPO_CITA}' no reconocido. Usando intent/tweet como fallback.")
@@ -1521,6 +1558,11 @@ if __name__ == "__main__":
                 last_start = last_success_started_at.get(bot_idx)
                 remaining_exact = max(0.0, (last_start + PERIOD) - time.time()) if last_start else 0
                 if remaining_exact > 0:
+                    Utils.log(
+                        bot._get_current_selenium_user(),
+                        f"Respetando PERIOD={PERIOD}s | espera restante={remaining_exact:.1f}s",
+                        bot_idx,
+                    )
                     await Utils.countdown_async(remaining_exact, "Esperando period", user=bot._get_current_selenium_user(), instancia_id=bot_idx)
 
                 action_start_t = time.time()
@@ -1538,7 +1580,7 @@ if __name__ == "__main__":
                     
                     Utils.log(
                         bot._get_current_selenium_user(), 
-                        f"✅ Cita {turno}/{total_turnos} OK en {dur:.1f}s | Restante Period: {remaining_period_calc:.1f}s", 
+                        f"✅ Cita {turno}/{total_turnos} OK | tiempo envío={dur:.1f}s | restante para próximo PERIOD={remaining_period_calc:.1f}s", 
                         bot_idx
                     )
                     
