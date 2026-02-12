@@ -36,7 +36,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 # ==========================
 
 # --- TARGETS Y USUARIOS ---
-SEARCH_TARGETS = ["DustGoa3907", "yarieltaxi"]
+SEARCH_TARGETS = ["runster_webster OR 1moonmanystars", "Jinxautista OR Plaga_V2P"]
 TARGET = " | ".join(SEARCH_TARGETS)
 URL_INICIAL = "https://x.com/notifications"
 USERS = ["sd50565", "juli24124", "mario152567", "rony24124"]
@@ -61,7 +61,7 @@ HEADLESS = False
 MODO_INSTANCIAS_SIMULTANEO = True 
 
 # --- AJUSTE DE INSTANCIAS ---
-NUM_INSTANCIAS = 2     
+NUM_INSTANCIAS = 1     
 TABS_POR_INSTANCIA = 1 
 
 # --- CONTENIDO ---
@@ -83,6 +83,8 @@ SLEEP_COOKIES = SLEEP_BASE
 SLEEP_COUNTDOWN_TICK = 1.0
 REINTENTOS_ENVIO = 5
 REINTENTOS_CONFIRMACION_ENVIO = 4
+
+REPLY_MODE_ALIASES = {"REPLY", "RESPUESTA", "RESPONDER"}
 
 # --- REINICIO ---
 AUTO_RESTART = True
@@ -1176,7 +1178,8 @@ class Bot:
         start_t = time.time()
         try:
             if MODO_ACCION == "CITA":
-                if TIPO_CITA == "BOTON":
+                tipo_cita_normalizado = (TIPO_CITA or "").strip().upper()
+                if tipo_cita_normalizado == "BOTON":
                     curr_url = self.driver.current_url
                     if "compose" in curr_url or "intent" in curr_url or (URL_INICIAL not in curr_url and "home" not in curr_url):
                         self._log(user, "URL incorrecta, navegando a inicial...")
@@ -1195,7 +1198,46 @@ class Bot:
                     
                     self._log(user, "Enviando tweet...")
                     if not await self._attempt_send_with_retry(user): return False, 0
+                elif tipo_cita_normalizado in REPLY_MODE_ALIASES:
+                    status_id = self._extract_status_id(link)
+                    if not status_id:
+                        self._log(user, f"No se pudo extraer status_id desde link: {link}")
+                        return False, 0
+
+                    base_handle = self.driver.current_window_handle
+                    reply_sent = False
+                    self._log(user, f"Modo Reply detectado ({TIPO_CITA}). Abriendo intent/reply en tab temporal...")
+                    self.driver.switch_to.new_window('tab')
+                    try:
+                        intent_reply_url = f"https://x.com/intent/tweet?in_reply_to={status_id}&text={quote(content)}"
+                        self.driver.get(intent_reply_url)
+                        await asyncio.sleep(SLEEP_CARGA)
+
+                        self._log(user, "Enviando reply (intent)...")
+                        if not await self._attempt_send_with_retry(user):
+                            return False, 0
+
+                        await asyncio.sleep(SLEEP_POST_CLICK)
+                        if smart_utils.is_composer_active(self.driver):
+                            self._log(user, "Composer sigue activo en tab intent/reply tras envío.")
+                            smart_utils.perform_smart_close(self.driver)
+                            await asyncio.sleep(SLEEP_RECOVERY)
+                            return False, 0
+
+                        reply_sent = True
+                    finally:
+                        try:
+                            if self.driver and len(self.driver.window_handles) > 1:
+                                self.driver.close()
+                                self.driver.switch_to.window(base_handle)
+                        except Exception as close_err:
+                            self._log(user, f"No se pudo cerrar/salir de tab temporal de reply: {close_err}")
+
+                    if reply_sent:
+                        dur = time.time() - start_t
+                        return True, dur
                 else:
+                    self._log(user, f"Modo '{TIPO_CITA}' no reconocido. Usando intent/tweet como fallback.")
                     self.driver.get(f"https://x.com/intent/tweet?text={quote(content)}")
                     if not await self._attempt_send_with_retry(user): return False, 0
 
