@@ -999,6 +999,21 @@ class Bot:
             return False
         return fallback_active
 
+    def _intent_is_home_ready(self):
+        """Devuelve True cuando la tab de intent/reply ya regresó a Home."""
+        try:
+            current_url = (self.driver.current_url or "").lower()
+        except Exception:
+            return False
+
+        home_markers = [
+            "x.com/home",
+            "twitter.com/home",
+            "x.com/i/",
+            "twitter.com/i/",
+        ]
+        return any(marker in current_url for marker in home_markers)
+
     def _has_send_success_toast(self):
         """Detecta toast de éxito al enviar en ES/EN y variantes."""
         success_patterns = [
@@ -1055,8 +1070,12 @@ class Bot:
                 toast_seen = True
 
             composer_open = self._intent_composer_still_open()
-            if toast_seen and not composer_open:
-                self._log(user, "Toast de envío detectado y composer cerrado en tab intent/reply.")
+            is_home_ready = self._intent_is_home_ready()
+            if toast_seen and (not composer_open or is_home_ready):
+                self._log(
+                    user,
+                    f"Reply OK: toast detectado y tab lista (home={is_home_ready}, composer_activo={composer_open}).",
+                )
                 return True
 
             if now - last_state_print >= 1.0:
@@ -1064,9 +1083,10 @@ class Bot:
                     curr_url = self.driver.current_url
                 except Exception:
                     curr_url = "(sin URL)"
+                remaining = max(0.0, end_t - now)
                 self._log(
                     user,
-                    f"Confirmando envío reply... toast={toast_seen} composer_activo={composer_open} url={curr_url}",
+                    f"Confirmando envío reply... toast={toast_seen} home={is_home_ready} composer_activo={composer_open} restante={remaining:.1f}s url={curr_url}",
                 )
                 last_state_print = now
 
