@@ -22,6 +22,7 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager 
 from twikit import Client
 
@@ -959,6 +960,101 @@ class Bot:
             await asyncio.sleep(SLEEP_BASE)
         return False
 
+    def _intent_composer_still_open(self):
+        """Detección robusta del composer en la pestaña intent/reply."""
+        try:
+            current_url = (self.driver.current_url or "").lower()
+        except Exception:
+            current_url = ""
+
+        if "intent/tweet" in current_url:
+            return True
+
+        composer_selectors = [
+            "[data-testid='tweetTextarea_0']",
+            "div[role='textbox'][data-testid='tweetTextarea_0']",
+            "div[role='dialog'] [data-testid='tweetTextarea_0']",
+            "div[aria-label='Post text']",
+            "div[aria-label='Texto de la publicación']",
+        ]
+
+        for selector in composer_selectors:
+            try:
+                elems = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                if any(elem.is_displayed() for elem in elems):
+                    return True
+            except WebDriverException:
+                continue
+            except Exception:
+                continue
+
+        return smart_utils.is_composer_active(self.driver)
+
+    def _has_send_success_toast(self):
+        """Detecta toast de éxito al enviar en ES/EN y variantes."""
+        success_patterns = [
+            "your post was sent",
+            "your reply was sent",
+            "post sent",
+            "post enviado",
+            "se envió",
+            "se envio",
+            "respuesta enviada",
+        ]
+
+        selectors = [
+            "div[data-testid='toast']",
+            "div[role='status']",
+            "div[aria-live='polite']",
+            "div[aria-live='assertive']",
+        ]
+
+        try:
+            candidates = []
+            for selector in selectors:
+                candidates.extend(self.driver.find_elements(By.CSS_SELECTOR, selector))
+
+            for elem in candidates:
+                try:
+                    if not elem.is_displayed():
+                        continue
+                    text = (elem.text or "").strip().lower()
+                    if text and any(pattern in text for pattern in success_patterns):
+                        return True
+                except WebDriverException:
+                    continue
+                except Exception:
+                    continue
+        except Exception:
+            return False
+
+        return False
+
+    async def _wait_intent_send_confirmation(self, user, timeout=8):
+        """Confirma envío en intent/reply esperando toast + cierre real del composer."""
+        end_t = time.time() + timeout
+        toast_seen = False
+
+        while time.time() < end_t:
+            if self._driver_closed():
+                return False
+
+            if self._has_send_success_toast():
+                toast_seen = True
+
+            composer_open = self._intent_composer_still_open()
+            if toast_seen and not composer_open:
+                self._log(user, "Toast de envío detectado y composer cerrado en tab intent/reply.")
+                return True
+
+            await asyncio.sleep(0.25)
+
+        if toast_seen:
+            self._log(user, "Toast detectado, pero composer/URL de intent sigue activo.")
+        else:
+            self._log(user, "No se detectó toast de envío dentro del tiempo esperado.")
+        return False
+
     def _tweet_created_ts(self, t):
         # Intentar extraer timestamp de varios atributos comunes.
         # Devuelve float(timestamp) en segundos UTC.
@@ -1242,8 +1338,8 @@ class Bot:
                         if not await self._attempt_send_with_retry(user):
                             reply_sent = False
                         else:
-                            await asyncio.sleep(SLEEP_POST_CLICK)
-                            if smart_utils.is_composer_active(self.driver):
+                            confirmed = await self._wait_intent_send_confirmation(user, timeout=8)
+                            if not confirmed and self._intent_composer_still_open():
                                 self._log(user, "Composer sigue activo en tab intent/reply tras envío.")
                                 smart_utils.perform_smart_close(self.driver)
                                 await asyncio.sleep(SLEEP_RECOVERY)
