@@ -10,7 +10,7 @@ import re
 import shutil
 import threading
 import atexit
-from datetime import datetime
+from datetime import datetime, timezone
 from urllib.parse import quote, unquote
 from pathlib import Path
 
@@ -43,14 +43,11 @@ USERS = ["sd50565", "juli24124", "mario152567", "rony24124"]
 EXCLUDE_USERS = ["rosi24124"]
 
 # --- CONFIGURACION DE LOGS Y FILTROS (NUEVO) ---
-PRINT_DETAILED_LOGS = True   # True: Imprime links y texto al iniciar y extraer. False: Solo numeros.
+PRINT_DETAILED_LOGS = True      # True: logs detallados de extracción.
+PRINT_TEXT_WITH_LINK = True     # True: muestra "| TEXTO: ..." junto al link extraído.
 
-# Nuevo: Modo flexible de filter
-# Opciones: "lang" -> añade lang:SEARCH_FILTER_VALUE
-#           "replies" -> añade filter:replies
-#           None -> sin filtro adicional
-SEARCH_FILTER_MODE = "lang"   # "lang" or "replies" or None
-SEARCH_FILTER_VALUE = "es"    # si SEARCH_FILTER_MODE == "lang", por ejemplo "es" para español
+# Filtro único para búsqueda. Ejemplos: "lang:es", "-filter:replies", "filter:replies"
+SEARCH_FILTER_QUERY = "lang:es"
 
 # --- LIMITES DE EXTRACCION ---
 MAX_TWEETS_FETCH = 30  # Maximo 30 tweets (evita leer tweets viejos masivos)
@@ -253,7 +250,7 @@ class Utils:
         Utils.log_global( "========================= MODO DE EJECUCION ========================")
         Utils.log_global( f"METODO=ACCION:{MODO_ACCION} | TIPO_CITA:{TIPO_CITA}")
         Utils.log_global( f"MODO=INSTANCIAS:{modo_instancias} | TOTAL:{num_instancias}")
-        Utils.log_global( f"LOGS DETALLADOS={PRINT_DETAILED_LOGS} | SEARCH_FILTER_MODE={SEARCH_FILTER_MODE} | SEARCH_FILTER_VALUE={SEARCH_FILTER_VALUE}")
+        Utils.log_global( f"LOGS DETALLADOS={PRINT_DETAILED_LOGS} | PRINT_TEXT_WITH_LINK={PRINT_TEXT_WITH_LINK} | SEARCH_FILTER_QUERY={SEARCH_FILTER_QUERY!r}")
         Utils.log_global( "=================================================================")
 
     @staticmethod
@@ -779,17 +776,81 @@ class Bot:
 
     def _build_search_url(self, search_term, excluded_users):
         parts = [search_term]
-        # Nueva lógica: usar SEARCH_FILTER_MODE y SEARCH_FILTER_VALUE
-        if SEARCH_FILTER_MODE == "replies":
-            parts.append("filter:replies")
-        elif SEARCH_FILTER_MODE == "lang" and SEARCH_FILTER_VALUE:
-            parts.append(f"lang:{SEARCH_FILTER_VALUE}")
+        filter_part = (SEARCH_FILTER_QUERY or "").strip()
+        if filter_part:
+            parts.append(filter_part)
 
         if excluded_users: parts.extend([f"-{u}" for u in sorted(excluded_users)])
         query_text = " ".join([p for p in parts if p]).strip()
         
         # NOTA: src=typed_query&f=live FUERZA EL MODO LIVE (LATEST)
         return f"https://x.com/search?q={quote(query_text)}&src=typed_query&f=live", query_text
+
+    def _extract_tweet_metadata(self, t, current_target_term):
+        text = (getattr(t, "text", "") or "").strip()
+        screen_name = (getattr(t, "user", None) and getattr(t.user, "screen_name", "") or "").strip().lower()
+        link = f"https://x.com/{getattr(t.user, 'screen_name')}/status/{getattr(t, 'id')}"
+        is_reply = bool(getattr(t, "in_reply_to_status_id", None) or getattr(t, "in_reply_to_user_id", None))
+        is_quote = bool(getattr(t, "is_quote_status", False) or getattr(t, "is_quote", False))
+
+        mentions = []
+        try:
+            ent = getattr(t, "entities", None)
+            if ent and isinstance(ent, dict):
+                ums = ent.get("user_mentions") or ent.get("mentions") or []
+                for m in ums:
+                    name = (m.get("screen_name") or m.get("username") or "").lower()
+                    if name and name not in mentions:
+                        mentions.append(name)
+        except:
+            pass
+        try:
+            found = re.findall(r"@([A-Za-z0-9_]{1,30})", text)
+            for f in found:
+                f = f.lower()
+                if f not in mentions:
+                    mentions.append(f)
+        except:
+            pass
+
+        exact_text_found = False
+        try:
+            for m in (self.msg_bag.mensajes or []):
+                if m and m.strip() and m.strip() in text:
+                    exact_text_found = True
+                    break
+        except:
+            exact_text_found = False
+
+        target_term = (current_target_term or "").strip().lower().replace("@", "")
+        mentioned_target = bool(target_term and target_term in mentions)
+        link_contains_target = bool(target_term and re.search(rf"x\.com/{re.escape(target_term)}/status/", link, re.IGNORECASE))
+        exact_target_text_found = bool(target_term and re.search(rf"(?<![A-Za-z0-9_]){re.escape(target_term)}(?![A-Za-z0-9_])", text, re.IGNORECASE))
+        should_enqueue = bool(link_contains_target or mentioned_target or exact_target_text_found or is_reply or is_quote or exact_text_found)
+
+        return {
+            "text": text,
+            "screen_name": screen_name,
+            "link": link,
+            "is_reply": bool(is_reply),
+            "is_quote": bool(is_quote),
+            "mentions": mentions,
+            "exact_text_found": bool(exact_text_found),
+            "target_term": target_term,
+            "mentioned_target": mentioned_target,
+            "link_contains_target": link_contains_target,
+            "exact_target_text_found": exact_target_text_found,
+            "should_enqueue": should_enqueue,
+        }
+
+    def _log_extracted_tweet(self, twikit_user, meta_entry):
+        base_msg = f"🔹 EXTRAIDO: {meta_entry['link']}"
+        if PRINT_TEXT_WITH_LINK:
+            preview = (meta_entry.get("text_preview") or "")[:100]
+            base_msg += f" | TEXTO: {preview}..."
+        self._log(twikit_user, base_msg)
+        self._log(twikit_user, f"      -> created_at={meta_entry['tweet_created_at']} saved_at={meta_entry['saved_at']}")
+        self._log(twikit_user, f"      -> target={meta_entry['target_term']} enqueue={meta_entry['should_enqueue']} | link_has_target={meta_entry['link_contains_target']} mention_target={meta_entry['mentioned_target']} exact_target={meta_entry['exact_target_text_found']} | reply={meta_entry['is_reply']} quote={meta_entry['is_quote']} mentions={meta_entry['mentions']} exact_text_found={meta_entry['exact_text_found']}")
 
     def _extract_query_term_from_target(self, raw_target):
         target = (raw_target or "").strip()
@@ -871,9 +932,9 @@ class Bot:
 
     def _format_iso(self, ts):
         try:
-            return datetime.utcfromtimestamp(float(ts)).isoformat() + "Z"
+            return datetime.fromtimestamp(float(ts), timezone.utc).isoformat().replace("+00:00", "Z")
         except:
-            return datetime.utcnow().isoformat() + "Z"
+            return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
     async def fetch(self, global_cycle_idx):
         twikit_user = self.all_users[global_cycle_idx % len(self.all_users)]
@@ -896,15 +957,12 @@ class Bot:
             count_extracted = 0
             limit_reached = False
             
-            # Crear filtro adicional según SEARCH_FILTER_MODE
-            filter_part = ""
-            if SEARCH_FILTER_MODE == "replies":
-                filter_part = "filter:replies"
-            elif SEARCH_FILTER_MODE == "lang" and SEARCH_FILTER_VALUE:
-                filter_part = f"lang:{SEARCH_FILTER_VALUE}"
+            # Filtro único configurable (ej: "lang:es", "-filter:replies")
+            filter_part = (SEARCH_FILTER_QUERY or "").strip()
 
             if self.is_link_mode:
                 normalized_link = self._normalize_link_with_replies(self.target_smart or TARGET, selenium_user)
+                target_term = self._extract_query_term_from_target(self.target_smart or TARGET)
                 if normalized_link and self.target_status_id: 
                     # Usa el filtro replies si esta activo
                     query = f"conversation_id:{self.target_status_id} {filter_part} filter:live {excl}".strip()
@@ -924,45 +982,16 @@ class Bot:
                         if count_extracted >= MAX_TWEETS_FETCH:
                             limit_reached = True
                             break
-                        screen_name = (getattr(t, "user", None) and getattr(t.user, "screen_name", "") or "").lower()
-                        if screen_name in excluded_users: continue
-                        link = f"https://x.com/{getattr(t.user, 'screen_name')}/status/{getattr(t, 'id')}"
-                        
-                        if link not in vistos and link not in cola:
-                            # Analisis de contenido
-                            text = (getattr(t, "text", "") or "").strip()
-                            is_reply = bool(getattr(t, "in_reply_to_status_id", None) or getattr(t, "in_reply_to_user_id", None))
-                            is_quote = bool(getattr(t, "is_quote_status", False) or getattr(t, "is_quote", False))
-                            mentions = []
-                            try:
-                                ent = getattr(t, "entities", None)
-                                if ent and isinstance(ent, dict):
-                                    ums = ent.get("user_mentions") or ent.get("mentions") or []
-                                    for m in ums:
-                                        name = (m.get("screen_name") or m.get("username") or "").lower()
-                                        if name: mentions.append(name)
-                            except:
-                                pass
-                            # fallback: buscar @ en texto
-                            try:
-                                found = re.findall(r"@([A-Za-z0-9_]{1,30})", text)
-                                for f in found:
-                                    if f.lower() not in mentions:
-                                        mentions.append(f.lower())
-                            except:
-                                pass
+                        tweet_info = self._extract_tweet_metadata(t, target_term)
+                        if tweet_info["screen_name"] in excluded_users:
+                            continue
+                        link = tweet_info["link"]
 
-                            # exact text match: verificar si alguno de los mensajes del MessageBag aparece EXACTAMENTE
-                            exact_text_found = False
-                            try:
-                                for m in (self.msg_bag.mensajes or []):
-                                    if not m: continue
-                                    # comparacion simple, sin convertir binario; si conviertes a binario, es posible no coincidir
-                                    if m.strip() and m.strip() in text:
-                                        exact_text_found = True
-                                        break
-                            except:
-                                exact_text_found = False
+                        if link not in vistos and link not in cola:
+                            if not tweet_info["should_enqueue"]:
+                                if PRINT_DETAILED_LOGS:
+                                    self._log(twikit_user, f"⏭ DESCARTADO (sin señales): {link} | target={tweet_info['target_term']}")
+                                continue
 
                             saved_at = time.time()
                             tweet_created_ts = float(ts or self._tweet_created_ts(t))
@@ -970,17 +999,21 @@ class Bot:
                                 "link": link,
                                 "saved_at": self._format_iso(saved_at),
                                 "tweet_created_at": self._format_iso(tweet_created_ts),
-                                "is_reply": bool(is_reply),
-                                "is_quote": bool(is_quote),
-                                "mentions": mentions,
-                                "exact_text_found": bool(exact_text_found),
+                                "is_reply": tweet_info["is_reply"],
+                                "is_quote": tweet_info["is_quote"],
+                                "mentions": tweet_info["mentions"],
+                                "exact_text_found": tweet_info["exact_text_found"],
+                                "target_term": tweet_info["target_term"],
+                                "mentioned_target": tweet_info["mentioned_target"],
+                                "link_contains_target": tweet_info["link_contains_target"],
+                                "exact_target_text_found": tweet_info["exact_target_text_found"],
+                                "should_enqueue": tweet_info["should_enqueue"],
+                                "text_preview": tweet_info["text"],
                                 "extracted_by_user": twikit_user,
                             }
 
                             if PRINT_DETAILED_LOGS:
-                                self._log(twikit_user, f"🔹 EXTRAIDO: {link} | TEXTO: {text[:100]}...")
-                                self._log(twikit_user, f"      -> created_at={meta_entry['tweet_created_at']} saved_at={meta_entry['saved_at']}")
-                                self._log(twikit_user, f"      -> reply={meta_entry['is_reply']} quote={meta_entry['is_quote']} mentions={meta_entry['mentions']} exact_text_found={meta_entry['exact_text_found']}")
+                                self._log_extracted_tweet(twikit_user, meta_entry)
 
                             cola.append(link); vistos.add(link)
                             meta[link] = meta_entry
@@ -993,13 +1026,14 @@ class Bot:
                     profile_user = self._extract_profile_user_from_target(target)
                     
                     if profile_user:
+                        target_term = profile_user
                         # Forzamos "from:profile_user" cuando target sea perfil
-                        # añadimos filter_part (lang:es o filter:replies) si procede
                         final_query = f"from:{profile_user} {filter_part} {excl}".strip()
                         self._log(twikit_user, f"FETCH GLOBAL | User {twikit_user} -> Target {profile_user} ({target_idx+1}/{len(self.search_targets)})")
                         self._log(twikit_user, f"🔎 QUERY TWIKIT: {final_query}")
                     else:
                         query_term = self._extract_query_term_from_target(target)
+                        target_term = query_term
                         # Build query and display URL for debugging (uses _build_search_url)
                         debug_url, final_query = self._build_search_url(query_term, excluded_users)
                         
@@ -1020,42 +1054,15 @@ class Bot:
                         if count_extracted >= MAX_TWEETS_FETCH:
                             limit_reached = True
                             break
-                        screen_name = (getattr(t, "user", None) and getattr(t.user, "screen_name", "") or "").lower()
-                        if screen_name in excluded_users: continue
-                        link = f"https://x.com/{getattr(t.user, 'screen_name')}/status/{getattr(t, 'id')}"
+                        tweet_info = self._extract_tweet_metadata(t, target_term)
+                        if tweet_info["screen_name"] in excluded_users:
+                            continue
+                        link = tweet_info["link"]
                         if link not in vistos and link not in cola:
-                            text = (getattr(t, "text", "") or "").strip()
-                            is_reply = bool(getattr(t, "in_reply_to_status_id", None) or getattr(t, "in_reply_to_user_id", None))
-                            is_quote = bool(getattr(t, "is_quote_status", False) or getattr(t, "is_quote", False))
-                            mentions = []
-                            try:
-                                ent = getattr(t, "entities", None)
-                                if ent and isinstance(ent, dict):
-                                    ums = ent.get("user_mentions") or ent.get("mentions") or []
-                                    for m in ums:
-                                        name = (m.get("screen_name") or m.get("username") or "").lower()
-                                        if name: mentions.append(name)
-                            except:
-                                pass
-                            # fallback: buscar @ en texto
-                            try:
-                                found = re.findall(r"@([A-Za-z0-9_]{1,30})", text)
-                                for f in found:
-                                    if f.lower() not in mentions:
-                                        mentions.append(f.lower())
-                            except:
-                                pass
-
-                            # exact text match
-                            exact_text_found = False
-                            try:
-                                for m in (self.msg_bag.mensajes or []):
-                                    if not m: continue
-                                    if m.strip() and m.strip() in text:
-                                        exact_text_found = True
-                                        break
-                            except:
-                                exact_text_found = False
+                            if not tweet_info["should_enqueue"]:
+                                if PRINT_DETAILED_LOGS:
+                                    self._log(twikit_user, f"⏭ DESCARTADO (sin señales): {link} | target={tweet_info['target_term']}")
+                                continue
 
                             saved_at = time.time()
                             tweet_created_ts = float(ts or self._tweet_created_ts(t))
@@ -1063,17 +1070,21 @@ class Bot:
                                 "link": link,
                                 "saved_at": self._format_iso(saved_at),
                                 "tweet_created_at": self._format_iso(tweet_created_ts),
-                                "is_reply": bool(is_reply),
-                                "is_quote": bool(is_quote),
-                                "mentions": mentions,
-                                "exact_text_found": bool(exact_text_found),
+                                "is_reply": tweet_info["is_reply"],
+                                "is_quote": tweet_info["is_quote"],
+                                "mentions": tweet_info["mentions"],
+                                "exact_text_found": tweet_info["exact_text_found"],
+                                "target_term": tweet_info["target_term"],
+                                "mentioned_target": tweet_info["mentioned_target"],
+                                "link_contains_target": tweet_info["link_contains_target"],
+                                "exact_target_text_found": tweet_info["exact_target_text_found"],
+                                "should_enqueue": tweet_info["should_enqueue"],
+                                "text_preview": tweet_info["text"],
                                 "extracted_by_user": twikit_user,
                             }
 
                             if PRINT_DETAILED_LOGS:
-                                self._log(twikit_user, f"🔹 EXTRAIDO: {link} | TEXTO: {text[:100]}...")
-                                self._log(twikit_user, f"      -> created_at={meta_entry['tweet_created_at']} saved_at={meta_entry['saved_at']}")
-                                self._log(twikit_user, f"      -> reply={meta_entry['is_reply']} quote={meta_entry['is_quote']} mentions={meta_entry['mentions']} exact_text_found={meta_entry['exact_text_found']}")
+                                self._log_extracted_tweet(twikit_user, meta_entry)
 
                             cola.append(link); vistos.add(link)
                             meta[link] = meta_entry
