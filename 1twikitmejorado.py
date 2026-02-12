@@ -56,7 +56,7 @@ MAX_TWEETS_FETCH = 30  # Maximo 30 tweets (evita leer tweets viejos masivos)
 MODO_EJECUCION = "HIBRIDO"   
 ROTAR_EN_HIBRIDO = False     
 MODO_ACCION = "CITA"         
-TIPO_CITA = "BOTON"
+TIPO_CITA = "REPLY"
 HEADLESS = False               
 MODO_INSTANCIAS_SIMULTANEO = True 
 
@@ -81,7 +81,7 @@ SLEEP_REINTENTO = SLEEP_BASE
 SLEEP_RECOVERY = SLEEP_BASE
 SLEEP_COOKIES = SLEEP_BASE
 SLEEP_COUNTDOWN_TICK = 1.0
-REINTENTOS_ENVIO = 5
+REINTENTOS_ENVIO = 3
 REINTENTOS_CONFIRMACION_ENVIO = 4
 
 REPLY_MODE_ALIASES = {"REPLY", "RESPUESTA", "RESPONDER"}
@@ -913,27 +913,50 @@ class Bot:
         if not user or user.lower() in {"search", "home", "notifications", "explore", "i"}: return None
         return user
 
+    def _wait_clickable_with_retries(self, user, selector, label, retries=3, timeout=3):
+        for intent_idx in range(1, retries + 1):
+            if self._driver_closed():
+                return None
+            try:
+                wait = WebDriverWait(self.driver, timeout, poll_frequency=0.1)
+                elem = wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector)))
+                return elem
+            except Exception as e:
+                self._log(user, f"{label} no disponible (espera {intent_idx}/{retries}): {e}")
+                if intent_idx < retries:
+                    time.sleep(SLEEP_BASE)
+        return None
+
     async def _attempt_send_with_retry(self, user):
-        selector_btn = "[data-testid='tweetButton']"
+        selector_reply = "[data-testid='tweetButton']"
         for attempt in range(1, REINTENTOS_ENVIO + 1):
-            if self._driver_closed(): return False
+            if self._driver_closed():
+                return False
             if not smart_utils.is_composer_active(self.driver):
                 self._log(user, f"Envío confirmado (composer cerrado) antes del intento {attempt}.")
                 return True
             try:
-                short_wait = WebDriverWait(self.driver, SLEEP_REINTENTO, poll_frequency=0.1)
-                btn = short_wait.until(EC.element_to_be_clickable((By.CSS_SELECTOR, selector_btn)))
-                
-                self._log(user, f"Haciendo click en Tweet (Intento {attempt})...")
-                smart_utils.safe_click(self.driver, btn, f"Botón Tweet intento {attempt}")
-                time.sleep(SLEEP_POST_CLICK)
-                
-                if not smart_utils.is_composer_active(self.driver):
-                    self._log(user, f"Envío confirmado en intento {attempt}/{REINTENTOS_ENVIO}.")
-                    return True
+                reply = self._wait_clickable_with_retries(
+                    user,
+                    selector_reply,
+                    "Botón Reply/Tweet",
+                    retries=3,
+                    timeout=3,
+                )
+                if not reply:
+                    self._log(user, f"No se encontró botón Reply/Tweet en intento {attempt}/{REINTENTOS_ENVIO}.")
+                else:
+                    self._log(user, f"Haciendo click en Reply (Intento {attempt})...")
+                    smart_utils.safe_click(self.driver, reply, f"Botón Reply intento {attempt}")
+
+                WebDriverWait(self.driver, 3, poll_frequency=0.1).until(
+                    lambda d: not smart_utils.is_composer_active(d)
+                )
+                self._log(user, f"Envío confirmado en intento {attempt}/{REINTENTOS_ENVIO}.")
+                return True
             except Exception as e:
                 self._log(user, f"Fallo intento {attempt}: {e}")
-            await asyncio.sleep(SLEEP_REINTENTO)
+            await asyncio.sleep(SLEEP_BASE)
         return False
 
     def _tweet_created_ts(self, t):
@@ -1206,8 +1229,10 @@ class Bot:
 
                     base_handle = self.driver.current_window_handle
                     reply_sent = False
+                    temp_handle = None
                     self._log(user, f"Modo Reply detectado ({TIPO_CITA}). Abriendo intent/reply en tab temporal...")
                     self.driver.switch_to.new_window('tab')
+                    temp_handle = self.driver.current_window_handle
                     try:
                         intent_reply_url = f"https://x.com/intent/tweet?in_reply_to={status_id}&text={quote(content)}"
                         self.driver.get(intent_reply_url)
@@ -1215,27 +1240,35 @@ class Bot:
 
                         self._log(user, "Enviando reply (intent)...")
                         if not await self._attempt_send_with_retry(user):
-                            return False, 0
-
-                        await asyncio.sleep(SLEEP_POST_CLICK)
-                        if smart_utils.is_composer_active(self.driver):
-                            self._log(user, "Composer sigue activo en tab intent/reply tras envío.")
-                            smart_utils.perform_smart_close(self.driver)
-                            await asyncio.sleep(SLEEP_RECOVERY)
-                            return False, 0
-
-                        reply_sent = True
+                            reply_sent = False
+                        else:
+                            await asyncio.sleep(SLEEP_POST_CLICK)
+                            if smart_utils.is_composer_active(self.driver):
+                                self._log(user, "Composer sigue activo en tab intent/reply tras envío.")
+                                smart_utils.perform_smart_close(self.driver)
+                                await asyncio.sleep(SLEEP_RECOVERY)
+                                reply_sent = False
+                            else:
+                                reply_sent = True
                     finally:
                         try:
-                            if self.driver and len(self.driver.window_handles) > 1:
-                                self.driver.close()
-                                self.driver.switch_to.window(base_handle)
+                            if self.driver:
+                                handles = self.driver.window_handles
+                                if temp_handle and temp_handle in handles:
+                                    self.driver.switch_to.window(temp_handle)
+                                    self.driver.close()
+                                handles_after = self.driver.window_handles
+                                if base_handle in handles_after:
+                                    self.driver.switch_to.window(base_handle)
+                                elif handles_after:
+                                    self.driver.switch_to.window(handles_after[0])
                         except Exception as close_err:
                             self._log(user, f"No se pudo cerrar/salir de tab temporal de reply: {close_err}")
 
                     if reply_sent:
                         dur = time.time() - start_t
                         return True, dur
+                    return False, 0
                 else:
                     self._log(user, f"Modo '{TIPO_CITA}' no reconocido. Usando intent/tweet como fallback.")
                     self.driver.get(f"https://x.com/intent/tweet?text={quote(content)}")
