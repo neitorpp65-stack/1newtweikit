@@ -792,6 +792,11 @@ class Bot:
         link = f"https://x.com/{getattr(t.user, 'screen_name')}/status/{getattr(t, 'id')}"
         is_reply = bool(getattr(t, "in_reply_to_status_id", None) or getattr(t, "in_reply_to_user_id", None))
         is_quote = bool(getattr(t, "is_quote_status", False) or getattr(t, "is_quote", False))
+        in_reply_to_screen_name = (
+            getattr(t, "in_reply_to_screen_name", None)
+            or getattr(t, "in_reply_to_username", None)
+            or ""
+        ).strip().lower().replace("@", "")
 
         mentions = []
         try:
@@ -823,10 +828,40 @@ class Bot:
             exact_text_found = False
 
         target_term = (current_target_term or "").strip().lower().replace("@", "")
-        mentioned_target = bool(target_term and target_term in mentions)
-        link_contains_target = bool(target_term and re.search(rf"x\.com/{re.escape(target_term)}/status/", link, re.IGNORECASE))
-        exact_target_text_found = bool(target_term and re.search(rf"(?<![A-Za-z0-9_]){re.escape(target_term)}(?![A-Za-z0-9_])", text, re.IGNORECASE))
-        should_enqueue = bool(link_contains_target or mentioned_target or exact_target_text_found or is_reply or is_quote or exact_text_found)
+        target_terms = []
+        for piece in re.split(r"(?i)\s+or\s+", target_term):
+            term = (piece or "").strip().replace("@", "")
+            if term and term not in target_terms:
+                target_terms.append(term)
+        if not target_terms and target_term:
+            target_terms = [target_term]
+
+        matched_terms_link = [
+            term for term in target_terms
+            if re.search(rf"x\.com/{re.escape(term)}/status/", link, re.IGNORECASE)
+        ]
+        matched_terms_mention = [term for term in target_terms if term in mentions]
+        matched_terms_exact_text = [
+            term for term in target_terms
+            if re.search(rf"(?<![A-Za-z0-9_]){re.escape(term)}(?![A-Za-z0-9_])", text, re.IGNORECASE)
+        ]
+        direct_reply_to_target = bool(in_reply_to_screen_name and in_reply_to_screen_name in target_terms)
+
+        link_contains_target = bool(matched_terms_link)
+        mentioned_target = bool(matched_terms_mention)
+        exact_target_text_found = bool(matched_terms_exact_text)
+
+        # "Ajeno" => solo mención sin respuesta directa ni quote.
+        # Para guardar exigimos señales fuertes por target: autor target,
+        # respuesta directa al target, quote/cita, texto exacto del target,
+        # o coincidencia exacta de mensajes configurados.
+        should_enqueue = bool(
+            link_contains_target
+            or direct_reply_to_target
+            or is_quote
+            or exact_target_text_found
+            or exact_text_found
+        )
 
         return {
             "text": text,
@@ -837,9 +872,15 @@ class Bot:
             "mentions": mentions,
             "exact_text_found": bool(exact_text_found),
             "target_term": target_term,
+            "target_terms": target_terms,
+            "in_reply_to_screen_name": in_reply_to_screen_name,
+            "direct_reply_to_target": direct_reply_to_target,
             "mentioned_target": mentioned_target,
             "link_contains_target": link_contains_target,
             "exact_target_text_found": exact_target_text_found,
+            "matched_terms_link": matched_terms_link,
+            "matched_terms_mention": matched_terms_mention,
+            "matched_terms_exact_text": matched_terms_exact_text,
             "should_enqueue": should_enqueue,
         }
 
@@ -850,7 +891,7 @@ class Bot:
             base_msg += f" | TEXTO: {preview}..."
         self._log(twikit_user, base_msg)
         self._log(twikit_user, f"      -> created_at={meta_entry['tweet_created_at']} saved_at={meta_entry['saved_at']}")
-        self._log(twikit_user, f"      -> target={meta_entry['target_term']} enqueue={meta_entry['should_enqueue']} | link_has_target={meta_entry['link_contains_target']} mention_target={meta_entry['mentioned_target']} exact_target={meta_entry['exact_target_text_found']} | reply={meta_entry['is_reply']} quote={meta_entry['is_quote']} mentions={meta_entry['mentions']} exact_text_found={meta_entry['exact_text_found']}")
+        self._log(twikit_user, f"      -> target={meta_entry['target_term']} terms={meta_entry.get('target_terms', [])} enqueue={meta_entry['should_enqueue']} | link_has_target={meta_entry['link_contains_target']} mention_target={meta_entry['mentioned_target']} exact_target={meta_entry['exact_target_text_found']} direct_reply_target={meta_entry.get('direct_reply_to_target', False)} | reply={meta_entry['is_reply']} quote={meta_entry['is_quote']} mentions={meta_entry['mentions']} reply_to={meta_entry.get('in_reply_to_screen_name', '')} exact_text_found={meta_entry['exact_text_found']}")
 
     def _extract_query_term_from_target(self, raw_target):
         target = (raw_target or "").strip()
@@ -1004,9 +1045,15 @@ class Bot:
                                 "mentions": tweet_info["mentions"],
                                 "exact_text_found": tweet_info["exact_text_found"],
                                 "target_term": tweet_info["target_term"],
+                                "target_terms": tweet_info.get("target_terms", []),
+                                "in_reply_to_screen_name": tweet_info.get("in_reply_to_screen_name", ""),
+                                "direct_reply_to_target": tweet_info.get("direct_reply_to_target", False),
                                 "mentioned_target": tweet_info["mentioned_target"],
                                 "link_contains_target": tweet_info["link_contains_target"],
                                 "exact_target_text_found": tweet_info["exact_target_text_found"],
+                                "matched_terms_link": tweet_info.get("matched_terms_link", []),
+                                "matched_terms_mention": tweet_info.get("matched_terms_mention", []),
+                                "matched_terms_exact_text": tweet_info.get("matched_terms_exact_text", []),
                                 "should_enqueue": tweet_info["should_enqueue"],
                                 "text_preview": tweet_info["text"],
                                 "extracted_by_user": twikit_user,
@@ -1075,9 +1122,15 @@ class Bot:
                                 "mentions": tweet_info["mentions"],
                                 "exact_text_found": tweet_info["exact_text_found"],
                                 "target_term": tweet_info["target_term"],
+                                "target_terms": tweet_info.get("target_terms", []),
+                                "in_reply_to_screen_name": tweet_info.get("in_reply_to_screen_name", ""),
+                                "direct_reply_to_target": tweet_info.get("direct_reply_to_target", False),
                                 "mentioned_target": tweet_info["mentioned_target"],
                                 "link_contains_target": tweet_info["link_contains_target"],
                                 "exact_target_text_found": tweet_info["exact_target_text_found"],
+                                "matched_terms_link": tweet_info.get("matched_terms_link", []),
+                                "matched_terms_mention": tweet_info.get("matched_terms_mention", []),
+                                "matched_terms_exact_text": tweet_info.get("matched_terms_exact_text", []),
                                 "should_enqueue": tweet_info["should_enqueue"],
                                 "text_preview": tweet_info["text"],
                                 "extracted_by_user": twikit_user,
