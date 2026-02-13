@@ -85,6 +85,10 @@ SLEEP_COUNTDOWN_TICK = 1.0
 REINTENTOS_ENVIO = 3
 REINTENTOS_CONFIRMACION_ENVIO = 4
 
+# Control de throttling CPU en Chrome (CDP Emulation.setCPUThrottlingRate)
+CPU_THROTTLE_MODE = "MODO1"  # modo1=solo al primer click de enviar en reply | modo2=siempre activo (global) | modo3=apagado
+CPU_THROTTLE_RATE = 8         # 1=sin throttle, 2..20 ralentiza Chrome (más alto = más lento / menos uso CPU)
+
 REPLY_MODE_ALIASES = {"REPLY", "RESPUESTA", "RESPONDER"}
 
 # --- REINICIO ---
@@ -254,6 +258,7 @@ class Utils:
         Utils.log_global( f"METODO=ACCION:{MODO_ACCION} | TIPO_CITA:{TIPO_CITA}")
         Utils.log_global( f"MODO=INSTANCIAS:{modo_instancias} | TOTAL:{num_instancias}")
         Utils.log_global( f"LOGS DETALLADOS={PRINT_DETAILED_LOGS} | PRINT_TEXT_WITH_LINK={PRINT_TEXT_WITH_LINK} | SEARCH_FILTER_QUERY={SEARCH_FILTER_QUERY!r}")
+        Utils.log_global( f"CPU_THROTTLE_MODE={CPU_THROTTLE_MODE} | CPU_THROTTLE_RATE={CPU_THROTTLE_RATE}")
         Utils.log_global( "=================================================================")
 
     @staticmethod
@@ -469,6 +474,8 @@ class Bot:
         self.search_targets_normalized = False
         self.is_link_mode = False
         self.last_fetch_ts = 0.0
+        self._reply_send_click_count = 0
+        self._cpu_throttle_applied = False
         self._print_json_paths()
         self._load_state()
         self._analyze_target_global()
@@ -605,7 +612,54 @@ class Bot:
         self.driver = self._build_driver(user)
         self._apply_window_placement()
         self._prepare_tabs()
+        self._apply_initial_cpu_throttle_if_needed(user)
         return self.driver
+
+    def _normalized_cpu_throttle_mode(self):
+        mode = (CPU_THROTTLE_MODE or "").strip().upper()
+        if mode in {"MODO1", "1", "REPLY", "REPLY_FIRST_SEND"}:
+            return "MODO1"
+        if mode in {"MODO2", "2", "GENERAL", "GLOBAL"}:
+            return "MODO2"
+        return "MODO3"
+
+    def _cpu_throttle_rate(self):
+        try:
+            return max(1, int(CPU_THROTTLE_RATE))
+        except Exception:
+            return 1
+
+    def _set_cpu_throttle(self, user, rate, reason=""):
+        if not self.driver:
+            return False
+        try:
+            safe_rate = max(1, int(rate))
+            self.driver.execute_cdp_cmd("Emulation.setCPUThrottlingRate", {"rate": safe_rate})
+            self._cpu_throttle_applied = safe_rate > 1
+            msg_reason = f" | motivo={reason}" if reason else ""
+            self._log(user, f"CPU throttle aplicado: rate={safe_rate}{msg_reason}")
+            return True
+        except Exception as e:
+            self._log(user, f"No se pudo aplicar CPU throttle (rate={rate}): {e}")
+            return False
+
+    def _apply_initial_cpu_throttle_if_needed(self, user):
+        mode = self._normalized_cpu_throttle_mode()
+        if mode != "MODO2":
+            return
+        self._set_cpu_throttle(user, self._cpu_throttle_rate(), "modo2-general")
+
+    def _maybe_apply_reply_send_throttle(self, user, is_reply_mode):
+        mode = self._normalized_cpu_throttle_mode()
+        if mode == "MODO3":
+            return
+        if mode == "MODO2":
+            if not self._cpu_throttle_applied:
+                self._set_cpu_throttle(user, self._cpu_throttle_rate(), "modo2-general")
+            return
+        if mode == "MODO1" and is_reply_mode and self._reply_send_click_count == 0:
+            if self._set_cpu_throttle(user, self._cpu_throttle_rate(), "modo1-primer-click-reply"):
+                self._reply_send_click_count += 1
 
     def _prepare_tabs(self):
         if not self.driver: return
@@ -928,7 +982,7 @@ class Bot:
                     time.sleep(SLEEP_BASE)
         return None
 
-    async def _attempt_send_with_retry(self, user):
+    async def _attempt_send_with_retry(self, user, is_reply_mode=False):
         selector_reply = "[data-testid='tweetButton']"
         for attempt in range(1, REINTENTOS_ENVIO + 1):
             if self._driver_closed():
@@ -947,6 +1001,7 @@ class Bot:
                 if not reply:
                     self._log(user, f"No se encontró botón Reply/Tweet en intento {attempt}/{REINTENTOS_ENVIO}.")
                 else:
+                    self._maybe_apply_reply_send_throttle(user, is_reply_mode=is_reply_mode)
                     self._log(user, f"Haciendo click en Reply (Intento {attempt})...")
                     smart_utils.safe_click(self.driver, reply, f"Botón Reply intento {attempt}")
 
@@ -1359,7 +1414,7 @@ class Bot:
                     await asyncio.sleep(SLEEP_ESCRITURA)
                     
                     self._log(user, "Enviando tweet...")
-                    if not await self._attempt_send_with_retry(user): return False, 0
+                    if not await self._attempt_send_with_retry(user, is_reply_mode=False): return False, 0
                 elif tipo_cita_normalizado in REPLY_MODE_ALIASES:
                     status_id = self._extract_status_id(link)
                     if not status_id:
@@ -1379,7 +1434,7 @@ class Bot:
                         await asyncio.sleep(SLEEP_CARGA)
 
                         self._log(user, "Enviando reply (intent)...")
-                        if not await self._attempt_send_with_retry(user):
+                        if not await self._attempt_send_with_retry(user, is_reply_mode=True):
                             reply_sent = False
                         else:
                             confirmed = await self._wait_intent_send_confirmation(user, timeout=8)
@@ -1425,7 +1480,7 @@ class Bot:
                 else:
                     self._log(user, f"Modo '{TIPO_CITA}' no reconocido. Usando intent/tweet como fallback.")
                     self.driver.get(f"https://x.com/intent/tweet?text={quote(content)}")
-                    if not await self._attempt_send_with_retry(user): return False, 0
+                    if not await self._attempt_send_with_retry(user, is_reply_mode=False): return False, 0
 
             await asyncio.sleep(SLEEP_POST_CLICK)
             if not smart_utils.is_composer_active(self.driver):
