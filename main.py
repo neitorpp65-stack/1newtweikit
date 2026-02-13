@@ -12,6 +12,7 @@ import shutil
 import traceback
 import platform
 import threading
+import atexit
 from typing import Optional, Dict, Any, List, Tuple
 from urllib.parse import quote, urlparse, urlunparse, unquote_plus, parse_qs
 from pathlib import Path
@@ -68,10 +69,10 @@ SETTINGS = {
     "ENABLE_DARK_MODE": True,
     "reply_intent": False,
     "FALLBACK_FIRST": "newtweet",
-    "CPU_LIMIT_PERCENT": 97,
+    "CPU_LIMIT_PERCENT": int(os.environ.get("CPU_LIMIT_PERCENT", 10)),
     "ENABLE_THROTTLING": True,
-    "THROTTLE_CYCLE_MS": 60,
-    "THROTTLE_REFRESH_CYCLES": 240,
+    "THROTTLE_CYCLE_MS": int(os.environ.get("THROTTLE_CYCLE_MS", 100)),
+    "THROTTLE_REFRESH_CYCLES": int(os.environ.get("THROTTLE_REFRESH_CYCLES", 20)),
     "OVERRIDE_SLEEP": float(os.environ.get("OVERRIDE_SLEEP", 0.0)),
     "USE_CLIPBOARD_PASTE": True,
     "POST_PASTE_SLEEP": 0.3,
@@ -159,6 +160,120 @@ CACHE_STORAGE_PATH = str(SCRIPTS_DIR / "storage_cache.json")
 CACHE_DIR = str(SCRIPTS_DIR / "chrome_cache") if IS_WINDOWS else "/data/data/com.termux/files/home/chrome_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
 # === BLOCK 1 END ===
+
+
+# === BLOCK 1B START: CPU LIMITER (BES-LIKE) ===
+_CPU_LIMITERS: Dict[int, "ChromeCpuLimiter"] = {}
+_CPU_LIMITERS_LOCK = threading.Lock()
+
+
+class ChromeCpuLimiter:
+    """CPU limiter tipo BES: suspende/reanuda procesos Chrome por duty-cycle."""
+
+    def __init__(self, root_pid: int, limit_percent: int = 10, cycle_ms: int = 100, inst_id: int = 1):
+        self.root_pid = int(root_pid)
+        self.limit_percent = max(1, min(100, int(limit_percent)))
+        self.cycle_ms = max(30, int(cycle_ms))
+        self.inst_id = inst_id
+        self._stop_evt = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self._processes: Dict[int, Any] = {}
+        self._refresh_countdown = 0
+
+    def _discover(self):
+        if not psutil:
+            return
+        found: Dict[int, Any] = {}
+        try:
+            root = psutil.Process(self.root_pid)
+            candidates = [root] + root.children(recursive=True)
+        except Exception:
+            candidates = []
+        for proc in candidates:
+            try:
+                name = (proc.name() or "").lower()
+                if "chrome" in name or "chromium" in name:
+                    found[proc.pid] = proc
+            except Exception:
+                continue
+        self._processes = found
+
+    def _suspend(self):
+        for pid, proc in list(self._processes.items()):
+            try:
+                if proc.is_running():
+                    proc.suspend()
+            except Exception:
+                self._processes.pop(pid, None)
+
+    def _resume(self):
+        for pid, proc in list(self._processes.items()):
+            try:
+                if proc.is_running():
+                    proc.resume()
+            except Exception:
+                self._processes.pop(pid, None)
+
+    def _run(self):
+        self._discover()
+        active_ms = max(5, int(self.cycle_ms * (self.limit_percent / 100.0)))
+        sleep_ms = max(0, self.cycle_ms - active_ms)
+        refresh_every = max(3, int(SETTINGS.get("THROTTLE_REFRESH_CYCLES", 20)))
+        while not self._stop_evt.is_set():
+            self._refresh_countdown -= 1
+            if self._refresh_countdown <= 0:
+                self._discover()
+                self._refresh_countdown = refresh_every
+            if sleep_ms > 0:
+                self._suspend()
+                self._stop_evt.wait(sleep_ms / 1000.0)
+                self._resume()
+            self._stop_evt.wait(active_ms / 1000.0)
+        self._resume()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, name=f"cpu-limiter-inst{self.inst_id}", daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop_evt.set()
+        self._resume()
+
+
+def start_cpu_limiter(driver_pid: Optional[int], inst_id: int):
+    if not psutil or not driver_pid or not SETTINGS.get("ENABLE_THROTTLING"):
+        return
+    percent = max(1, min(100, int(SETTINGS.get("CPU_LIMIT_PERCENT", 10))))
+    cycle_ms = max(30, int(SETTINGS.get("THROTTLE_CYCLE_MS", 100)))
+    with _CPU_LIMITERS_LOCK:
+        old = _CPU_LIMITERS.pop(inst_id, None)
+        if old:
+            old.stop()
+        limiter = ChromeCpuLimiter(driver_pid, percent, cycle_ms, inst_id)
+        limiter.start()
+        _CPU_LIMITERS[inst_id] = limiter
+    log(f"[MASTER][INST{inst_id}] CPU limiter activo (objetivo~{percent}% ciclo={cycle_ms}ms, tipo BES)")
+
+
+def stop_cpu_limiter(inst_id: int):
+    with _CPU_LIMITERS_LOCK:
+        lim = _CPU_LIMITERS.pop(inst_id, None)
+    if lim:
+        lim.stop()
+
+
+def stop_all_cpu_limiters():
+    with _CPU_LIMITERS_LOCK:
+        items = list(_CPU_LIMITERS.items())
+        _CPU_LIMITERS.clear()
+    for _, lim in items:
+        lim.stop()
+
+
+atexit.register(stop_all_cpu_limiters)
+# === BLOCK 1B END ===
 
 
 # === BLOCK 2 START: LOGGING & FILE HELPERS ===
@@ -462,17 +577,9 @@ def create_driver(opts, inst_id=1):
             driver_pid = None
         if SETTINGS.get("CPU_LIMIT_PERCENT", 0) > 0 and psutil and driver_pid:
             try:
-                limit_chrome_cpu(driver_pid, inst_id)
-            except Exception:
-                pass
-        if SETTINGS.get("ENABLE_THROTTLING") and psutil and driver_pid:
-            try:
-                percent = SETTINGS["CPU_LIMIT_PERCENT"]
-                cycle_ms = SETTINGS["THROTTLE_CYCLE_MS"]
-                suspend_ms = cycle_ms * (1 - percent / 100.0)
-                throttle_chrome_processes(driver_pid, suspend_ms, cycle_ms, inst_id)
-            except Exception:
-                pass
+                start_cpu_limiter(driver_pid, inst_id)
+            except Exception as e:
+                log(f"[WARN][INST{inst_id}] no se pudo iniciar CPU limiter: {e}")
         if psutil:
             try:
                 current_process = psutil.Process(os.getpid())
