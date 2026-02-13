@@ -26,6 +26,11 @@ from selenium.common.exceptions import WebDriverException
 from webdriver_manager.chrome import ChromeDriverManager 
 from twikit import Client
 
+try:
+    import psutil
+except Exception:
+    psutil = None
+
 # ==========================
 # RUTAS SISTEMA BASE
 # ==========================
@@ -86,8 +91,8 @@ REINTENTOS_ENVIO = 3
 REINTENTOS_CONFIRMACION_ENVIO = 4
 
 # Control de throttling CPU en Chrome (CDP Emulation.setCPUThrottlingRate)
-CPU_THROTTLE_MODE = "MODO1"  # modo1=solo al primer click de enviar en reply | modo2=siempre activo (global) | modo3=apagado
-CPU_THROTTLE_RATE = 8         # 1=sin throttle, 2..20 ralentiza Chrome (más alto = más lento / menos uso CPU)
+CPU_THROTTLE_MODE = "MODO2"  # modo1=solo al primer click de enviar en reply | modo2=siempre activo (global) | modo3=apagado
+CPU_THROTTLE_RATE = 10         # porcentaje objetivo máximo de CPU para Chrome (~10 recomendado)
 
 REPLY_MODE_ALIASES = {"REPLY", "RESPUESTA", "RESPONDER"}
 
@@ -166,6 +171,76 @@ try:
 except ImportError:
     print("\n[USUARIO] ERROR CRITICO: Ejecuta el script generador del modulo 'smart_utils' primero.\n", flush=True)
     sys.exit(1)
+
+
+
+class BesCpuLimiter:
+    def __init__(self, root_pid, limit_percent=10, cycle_ms=100):
+        self.root_pid = int(root_pid)
+        self.limit_percent = max(1, min(100, int(limit_percent)))
+        self.cycle_ms = max(30, int(cycle_ms))
+        self._stop = threading.Event()
+        self._thread = None
+        self._procs = {}
+
+    def _discover(self):
+        if not psutil:
+            return
+        found = {}
+        try:
+            root = psutil.Process(self.root_pid)
+            candidates = [root] + root.children(recursive=True)
+        except Exception:
+            candidates = []
+        for p in candidates:
+            try:
+                name = (p.name() or '').lower()
+                if 'chrome' in name or 'chromium' in name:
+                    found[p.pid] = p
+            except Exception:
+                continue
+        self._procs = found
+
+    def _suspend(self):
+        for pid, p in list(self._procs.items()):
+            try:
+                if p.is_running():
+                    p.suspend()
+            except Exception:
+                self._procs.pop(pid, None)
+
+    def _resume(self):
+        for pid, p in list(self._procs.items()):
+            try:
+                if p.is_running():
+                    p.resume()
+            except Exception:
+                self._procs.pop(pid, None)
+
+    def _run(self):
+        on_ms = max(5, int(self.cycle_ms * (self.limit_percent / 100.0)))
+        off_ms = max(0, self.cycle_ms - on_ms)
+        ticks = 0
+        while not self._stop.is_set():
+            ticks += 1
+            if ticks % 20 == 1:
+                self._discover()
+            if off_ms > 0:
+                self._suspend()
+                self._stop.wait(off_ms / 1000.0)
+                self._resume()
+            self._stop.wait(on_ms / 1000.0)
+        self._resume()
+
+    def start(self):
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(target=self._run, daemon=True, name='bes-cpu-limiter')
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._resume()
 
 # ==========================
 # CLASES DE UTILIDAD
@@ -476,6 +551,7 @@ class Bot:
         self.last_fetch_ts = 0.0
         self._reply_send_click_count = 0
         self._cpu_throttle_applied = False
+        self._bes_cpu_limiter = None
         self._print_json_paths()
         self._load_state()
         self._analyze_target_global()
@@ -632,15 +708,36 @@ class Bot:
     def _set_cpu_throttle(self, user, rate, reason=""):
         if not self.driver:
             return False
+        target = max(1, min(100, int(rate)))
+        msg_reason = f" | motivo={reason}" if reason else ""
+        # 1) Intento principal tipo BES (suspend/resume por proceso, afecta subprocesos de Chrome).
+        if psutil:
+            try:
+                pid = None
+                try:
+                    pid = self.driver.service.process.pid if self.driver.service and self.driver.service.process else None
+                except Exception:
+                    pid = None
+                if pid:
+                    if self._bes_cpu_limiter:
+                        self._bes_cpu_limiter.stop()
+                    self._bes_cpu_limiter = BesCpuLimiter(pid, limit_percent=target, cycle_ms=100)
+                    self._bes_cpu_limiter.start()
+                    self._cpu_throttle_applied = True
+                    self._log(user, f"CPU limiter BES aplicado: max~{target}%{msg_reason}")
+                    return True
+            except Exception as e:
+                self._log(user, f"Fallo CPU limiter BES (max~{target}%): {e}")
+
+        # 2) Fallback CDP (menos estricto en subprocesos).
         try:
-            safe_rate = max(1, int(rate))
-            self.driver.execute_cdp_cmd("Emulation.setCPUThrottlingRate", {"rate": safe_rate})
-            self._cpu_throttle_applied = safe_rate > 1
-            msg_reason = f" | motivo={reason}" if reason else ""
-            self._log(user, f"CPU throttle aplicado: rate={safe_rate}{msg_reason}")
+            cdp_rate = max(1, int(100 / max(1, target)))
+            self.driver.execute_cdp_cmd("Emulation.setCPUThrottlingRate", {"rate": cdp_rate})
+            self._cpu_throttle_applied = cdp_rate > 1
+            self._log(user, f"CPU throttle CDP fallback aplicado: rate={cdp_rate} (~{target}%){msg_reason}")
             return True
         except Exception as e:
-            self._log(user, f"No se pudo aplicar CPU throttle (rate={rate}): {e}")
+            self._log(user, f"No se pudo aplicar CPU throttle (target={target}%): {e}")
             return False
 
     def _apply_initial_cpu_throttle_if_needed(self, user):
@@ -718,6 +815,11 @@ class Bot:
         except: return
 
     def shutdown_driver(self):
+        if self._bes_cpu_limiter:
+            try:
+                self._bes_cpu_limiter.stop()
+            except: pass
+            self._bes_cpu_limiter = None
         if not self.driver: return
         try:
             self._inst_user_log("Cierre limpio de instancia...")
