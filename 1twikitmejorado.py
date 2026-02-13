@@ -57,6 +57,7 @@ SEARCH_FILTER_QUERY = "lang:es"
 
 # --- LIMITES DE EXTRACCION ---
 MAX_TWEETS_FETCH = 30  # Maximo 30 tweets (evita leer tweets viejos masivos)
+MAX_TWEET_AGE_HOURS = 10  # No guardar/citar tweets con más de esta antigüedad.
 
 # --- MODO DE EJECUCION ---
 MODO_EJECUCION = "HIBRIDO"   
@@ -89,6 +90,7 @@ SLEEP_COOKIES = SLEEP_BASE
 SLEEP_COUNTDOWN_TICK = 1.0
 REINTENTOS_ENVIO = 3
 REINTENTOS_CONFIRMACION_ENVIO = 4
+REPLY_INTENT_INITIAL_SLEEP = 1.5
 
 # Control de throttling CPU en Chrome (CDP Emulation.setCPUThrottlingRate)
 CPU_THROTTLE_MODE = "MODO2"  # modo1=solo al primer click de enviar en reply | modo2=siempre activo (global) | modo3=apagado
@@ -1298,6 +1300,42 @@ class Bot:
         except:
             return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+    def _parse_iso_to_ts(self, value):
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            return None
+        return None
+
+    def _is_tweet_fresh(self, tweet_created_ts, max_age_hours=MAX_TWEET_AGE_HOURS):
+        try:
+            age_seconds = time.time() - float(tweet_created_ts)
+        except Exception:
+            return False
+        return age_seconds <= float(max_age_hours) * 3600.0
+
+    def _purge_stale_queue_entries(self, cola, meta):
+        if not cola:
+            return cola, meta, 0
+        fresh_cola = []
+        removed = 0
+        for link in cola:
+            entry = meta.get(link, {}) if isinstance(meta, dict) else {}
+            created_ts = self._parse_iso_to_ts(entry.get("tweet_created_at"))
+            if created_ts is not None and not self._is_tweet_fresh(created_ts):
+                removed += 1
+                if isinstance(meta, dict):
+                    meta.pop(link, None)
+                continue
+            fresh_cola.append(link)
+        return fresh_cola, meta, removed
+
+
     async def fetch(self, global_cycle_idx):
         twikit_user = self.all_users[global_cycle_idx % len(self.all_users)]
         selenium_user = self._get_current_selenium_user() 
@@ -1313,6 +1351,9 @@ class Bot:
             excluded_users = self._build_excluded_users()
             excl = " ".join([f"-{u}" for u in sorted(excluded_users)])
             cola, vistos, meta = self._load_queue_and_seen()
+            cola, meta, stale_removed = self._purge_stale_queue_entries(cola, meta)
+            if stale_removed:
+                self._log(twikit_user, f"🧹 Purga de cola por antigüedad>{MAX_TWEET_AGE_HOURS}h: -{stale_removed}")
             cola_before = len(cola)
             
             # --- LIMITE DE EXTRACCION (EN LOGICA) ---
@@ -1357,6 +1398,10 @@ class Bot:
 
                             saved_at = time.time()
                             tweet_created_ts = float(ts or self._tweet_created_ts(t))
+                            if not self._is_tweet_fresh(tweet_created_ts):
+                                if PRINT_DETAILED_LOGS:
+                                    self._log(twikit_user, f"⏭ DESCARTADO (antigüedad>{MAX_TWEET_AGE_HOURS}h): {link}")
+                                continue
                             meta_entry = {
                                 "link": link,
                                 "saved_at": self._format_iso(saved_at),
@@ -1434,6 +1479,10 @@ class Bot:
 
                             saved_at = time.time()
                             tweet_created_ts = float(ts or self._tweet_created_ts(t))
+                            if not self._is_tweet_fresh(tweet_created_ts):
+                                if PRINT_DETAILED_LOGS:
+                                    self._log(twikit_user, f"⏭ DESCARTADO (antigüedad>{MAX_TWEET_AGE_HOURS}h): {link}")
+                                continue
                             meta_entry = {
                                 "link": link,
                                 "saved_at": self._format_iso(saved_at),
@@ -1534,17 +1583,29 @@ class Bot:
                         self._log(user, f"Reply intent URL: {intent_reply_url}")
                         self.driver.get(intent_reply_url)
                         await asyncio.sleep(SLEEP_CARGA)
+                        await asyncio.sleep(REPLY_INTENT_INITIAL_SLEEP)
 
                         self._log(user, "Enviando reply (intent)...")
                         if not await self._attempt_send_with_retry(user, is_reply_mode=True):
-                            reply_sent = False
+                            if self._intent_composer_still_open():
+                                self._log(user, "Composer detectado tras carga lenta. Reintentando envío una vez más...")
+                                await asyncio.sleep(SLEEP_BASE)
+                                if await self._attempt_send_with_retry(user, is_reply_mode=True):
+                                    confirmed = await self._wait_intent_send_confirmation(user, timeout=8)
+                                    reply_sent = bool(confirmed)
+                                else:
+                                    reply_sent = False
+                            else:
+                                reply_sent = False
                         else:
                             confirmed = await self._wait_intent_send_confirmation(user, timeout=8)
                             if not confirmed and self._intent_composer_still_open():
-                                self._log(user, "Composer sigue activo en tab intent/reply tras envío.")
-                                smart_utils.perform_smart_close(self.driver)
-                                await asyncio.sleep(SLEEP_RECOVERY)
-                                reply_sent = False
+                                self._log(user, "Composer sigue activo en tab intent/reply tras envío. Reintento único con verificación de toast...")
+                                await asyncio.sleep(SLEEP_BASE)
+                                if await self._attempt_send_with_retry(user, is_reply_mode=True):
+                                    reply_sent = await self._wait_intent_send_confirmation(user, timeout=8)
+                                else:
+                                    reply_sent = False
                             else:
                                 reply_sent = True
                     finally:
@@ -1577,7 +1638,34 @@ class Bot:
                         dur = time.time() - start_t
                         self._log(user, f"Reply finalizado correctamente en {dur:.1f}s.")
                         return True, dur
-                    self._log(user, "Reply no confirmado. Se devolverá a cola para reintento.")
+
+                    self._log(user, "Reply no confirmado. Activando fallback tipo BOTON en notifications con link...")
+                    try:
+                        curr_url = self.driver.current_url
+                    except Exception:
+                        curr_url = ""
+                    if "compose" in curr_url or "intent" in curr_url or (URL_INICIAL not in curr_url and "home" not in curr_url):
+                        self._log(user, "Fallback: URL incorrecta, navegando a notifications...")
+                        self.driver.get(URL_INICIAL)
+                        await asyncio.sleep(SLEEP_CARGA)
+
+                    fallback_content = f"{content}\n\n{link}"
+                    self._log(user, "Fallback: abriendo composer con tecla 'n'...")
+                    self.driver.find_element(By.TAG_NAME, "body").send_keys("n")
+                    box = wait.until(EC.visibility_of_element_located((By.CSS_SELECTOR, "[data-testid='tweetTextarea_0']")))
+                    box.click()
+                    self.driver.execute_script("arguments[0].value = '';", box)
+                    box.send_keys(fallback_content)
+                    await asyncio.sleep(SLEEP_ESCRITURA)
+
+                    if await self._attempt_send_with_retry(user, is_reply_mode=False):
+                        await asyncio.sleep(SLEEP_POST_CLICK)
+                        if not smart_utils.is_composer_active(self.driver):
+                            dur = time.time() - start_t
+                            self._log(user, f"Fallback BOTON OK en {dur:.1f}s.")
+                            return True, dur
+
+                    self._log(user, "Fallback BOTON también falló. Se devolverá a cola para reintento.")
                     return False, 0
                 else:
                     self._log(user, f"Modo '{TIPO_CITA}' no reconocido. Usando intent/tweet como fallback.")
@@ -1612,6 +1700,24 @@ class Bot:
 
         link = self._pop_link()
         if not link:
+            return {"processed": 0, "last_send_duration": 0}
+
+        cola_meta = {}
+        try:
+            cola_meta = Utils.load_json(self.f_meta) if os.path.exists(self.f_meta) else {}
+        except Exception:
+            cola_meta = {}
+        link_meta = cola_meta.get(link, {}) if isinstance(cola_meta, dict) else {}
+        link_created_ts = self._parse_iso_to_ts(link_meta.get("tweet_created_at"))
+        if link_created_ts is not None and not self._is_tweet_fresh(link_created_ts):
+            self._log(curr_selenium_user, f"⏭ Link expirado (> {MAX_TWEET_AGE_HOURS}h), no se cita ni reencola: {link}")
+            with _LINK_STORE_LOCK:
+                cola = Utils.load_json(self.f_cola)
+                meta = Utils.load_json(self.f_meta) if os.path.exists(self.f_meta) else {}
+                if isinstance(meta, dict):
+                    meta.pop(link, None)
+                Utils.save_json(self.f_cola, cola)
+                Utils.save_json(self.f_meta, meta)
             return {"processed": 0, "last_send_duration": 0}
 
         with _LINK_STORE_LOCK:
